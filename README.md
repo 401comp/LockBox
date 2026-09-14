@@ -103,3 +103,7 @@ this repo rather than being written ad-hoc.
 - `crypto_core.py` — vault format, scrypt/AES-GCM, encrypt/decrypt engines.
 - `setup.py` — py2app config.
 - `build.sh` — venv + build + DMG.
+
+## License
+
+MIT — see `LICENSE`.
