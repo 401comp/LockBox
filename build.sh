@@ -141,6 +141,13 @@ ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG_PATH" >/dev/null
 rm -rf "$STAGE"
 
+echo "==> Building self-contained app ZIP"
+APP_ZIP="dist/${APP_NAME}-1.0.0-macos.zip"
+rm -f "$APP_ZIP"
+ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$APP_ZIP"
+unzip -t "$APP_ZIP" >/dev/null
+echo "   $APP_ZIP"
+
 echo "==> Building source zip"
 SRC_ZIP="dist/${APP_NAME}-src.zip"
 rm -f "$SRC_ZIP"
@@ -153,4 +160,5 @@ echo ""
 echo "Done."
 echo "  App: $APP_BUNDLE"
 echo "  DMG: $DMG_PATH"
+echo "  ZIP: $APP_ZIP"
 echo "  Src: $SRC_ZIP"
