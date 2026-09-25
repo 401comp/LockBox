@@ -1,8 +1,9 @@
 # LockBox
 
 Folder-level encryption for macOS. Pick a folder, give it a password, and
-LockBox writes a sibling `Vaulted/` folder that hides every file — including
-their names and directory structure. Decrypt back with the same password.
+LockBox replaces it with a sibling `Vaulted/` folder that hides every file —
+including their names and directory structure. Decrypt back with the same
+password.
 
 Unlike full-disk (FileVault) or container-mount (VeraCrypt) tools, LockBox
 operates at folder granularity: you point it at exactly what you want
@@ -12,7 +13,10 @@ protected, and the rest of your disk stays untouched.
 
 - **Encrypts a folder** into a sibling `Vaulted/` — random-UUID `.enc` blobs
   under `Vaulted/data/`, plus a small `vault.meta` header. Original filenames
-  and folder structure live *inside* the encrypted blobs.
+  and folder structure live *inside* the encrypted blobs. After every file is
+  encrypted and verified, the source folder is removed by default, leaving
+  only the opaque vault in Finder. Check **Keep the original folder after
+  encrypting** to retain a plaintext copy.
 - **Decrypts a vault** back into a sibling `Unvaulted/`, reconstructing the
   original tree (paths and mtimes preserved).
 - **Prompts for a password every time** — nothing is stored in the Keychain.
@@ -48,7 +52,7 @@ Output goes next to the input:
 
 ```
 Documents/
-  Secret/               ← disappears after successful encrypt
+  Secret/               ← removed after successful encrypt (the default)
   Vaulted/              ← new; opaque
     vault.meta
     data/
@@ -70,7 +74,8 @@ Requires Homebrew Python 3.14 with Tk 9.
 That script creates a local `.venv`, installs `cryptography` and `py2app`,
 runs the self-test, builds `dist/LockBox.app`, checks with `otool -L` that
 nothing links back to Homebrew paths (so the .app runs on Macs without
-Homebrew), and produces `dist/LockBox.dmg` and `dist/LockBox-src.zip`.
+Homebrew), and produces `dist/LockBox.dmg` and the self-contained
+`dist/LockBox-macos.zip`.
 
 Override the interpreter with `PYTHON_BIN=/path/to/python ./build.sh`.
 

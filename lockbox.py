@@ -1,6 +1,8 @@
 """LockBox — folder encryption app.
 
-Drag-in folder → encrypted `Vaulted/` sibling. Decrypt back to `Unvaulted/`.
+Drag-in folder → encrypted `Vaulted/` sibling. The verified plaintext source
+is removed by default, so Finder shows the vault rather than its contents.
+Decrypt back to `Unvaulted/`.
 Every source file is AES-256-GCM'd with a scrypt-derived key. Filenames and
 directory structure are hidden inside the encrypted blobs.
 """
@@ -28,7 +30,7 @@ from crypto_core import (
 )
 
 APP_NAME = "LockBox"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # ---------- paths / prefs / history -----------------------------------------
 
@@ -494,7 +496,7 @@ class LockBoxApp:
         ).pack(anchor="w")
         ttk.Label(
             outer,
-            text="Encrypt a folder into a sibling  Vaulted/  folder. Decrypt it back.",
+            text="Encrypt a folder into an opaque sibling Vaulted/ folder. Decrypt it back.",
             foreground="systemSecondaryLabelColor",
         ).pack(anchor="w", pady=(0, 12))
 
@@ -532,12 +534,13 @@ class LockBoxApp:
         )
         self.dec_btn.pack(side="left", padx=8)
 
-        # Delete-source option (off by default — encrypting never touches
-        # the source unless this is explicitly checked).
-        self.delete_source_var = tk.BooleanVar(value=False)
+        # The normal lock-up flow replaces the visible plaintext folder with
+        # a verified vault.  Keeping the original is still available for a
+        # backup-first workflow, but must be opted into deliberately.
+        self.delete_source_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             outer,
-            text="Delete source files after encrypting (verified first)",
+            text="Keep the original folder after encrypting",
             variable=self.delete_source_var,
         ).pack(anchor="w", pady=(0, 4))
 
@@ -546,10 +549,10 @@ class LockBoxApp:
         # folder is named after the source (visible in Finder) or hidden
         # behind the generic "data" name. Meaningless in Combine mode
         # (always concealed there), so it's disabled while that's checked.
-        self.reveal_name_var = tk.BooleanVar(value=True)
+        self.reveal_name_var = tk.BooleanVar(value=False)
         self.reveal_name_chk = ttk.Checkbutton(
             outer,
-            text="Keep encrypted folder name visible",
+            text="Show the original folder name inside the vault",
             variable=self.reveal_name_var,
         )
         self.reveal_name_chk.pack(anchor="w", pady=(0, 8))
@@ -644,17 +647,17 @@ class LockBoxApp:
         if file_count == 0:
             messagebox.showerror(APP_NAME, "No files found inside that folder.")
             return
-        delete_after = self.delete_source_var.get()
-        if delete_after:
+        keep_original = self.delete_source_var.get()
+        if not keep_original:
             note = (
                 "Every file is encrypted and verified first — source files are "
                 "only deleted after the ENTIRE folder has been verified in the "
-                "vault. A failure partway through leaves the source untouched."
+                "vault. On success, Finder will show only the encrypted vault. "
+                "A failure partway through leaves the source untouched."
             )
         else:
             note = (
-                "The original folder is left untouched — the encrypted copy is "
-                "created next to it."
+                "The original folder will stay beside the encrypted vault."
             )
         if not messagebox.askyesno(
             APP_NAME,
@@ -669,7 +672,7 @@ class LockBoxApp:
             self._do_encrypt,
             path,
             dlg.result,
-            delete_after,
+            not keep_original,
             self.key_bits_var.get(),
             self.reveal_name_var.get(),
         )
@@ -708,17 +711,17 @@ class LockBoxApp:
             messagebox.showerror(APP_NAME, "No files found inside those folders.")
             return
         names = ", ".join(f.name for f in folders)
-        delete_after = self.delete_source_var.get()
-        if delete_after:
+        keep_original = self.delete_source_var.get()
+        if not keep_original:
             note = (
                 "Every file is encrypted and verified first — source files are "
                 "only deleted after ALL folders have been fully verified in "
-                "the vault. A failure partway through leaves everything untouched."
+                "the vault. On success, Finder will show only the encrypted vault. "
+                "A failure partway through leaves everything untouched."
             )
         else:
             note = (
-                "The original folders are left untouched — the encrypted copy "
-                "is created separately."
+                "The original folders will stay beside the encrypted vault."
             )
         if not messagebox.askyesno(
             APP_NAME,
@@ -731,7 +734,7 @@ class LockBoxApp:
         if not pw_dlg.result:
             return
         self._start_worker(
-            self._do_combine, folders, pw_dlg.result, delete_after, self.key_bits_var.get()
+            self._do_combine, folders, pw_dlg.result, not keep_original, self.key_bits_var.get()
         )
 
     # Worker plumbing --------------------------------------------------------

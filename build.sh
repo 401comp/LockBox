@@ -12,6 +12,7 @@ cd "$HERE"
 VENV="$HERE/.venv"
 PY="$VENV/bin/python"
 APP_NAME="LockBox"
+APP_VERSION="1.0.1"
 APP_BUNDLE="dist/$APP_NAME.app"
 DMG_PATH="dist/${APP_NAME}.dmg"
 
@@ -142,7 +143,7 @@ hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG_P
 rm -rf "$STAGE"
 
 echo "==> Building self-contained app ZIP"
-APP_ZIP="dist/${APP_NAME}-1.0.0-macos.zip"
+APP_ZIP="dist/${APP_NAME}-${APP_VERSION}-macos.zip"
 rm -f "$APP_ZIP"
 ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$APP_ZIP"
 unzip -t "$APP_ZIP" >/dev/null
