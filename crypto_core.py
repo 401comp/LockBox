@@ -1,23 +1,21 @@
 """LockBox crypto core.
 
-Vault layout inside `Vaulted/`:
+Vault layout inside a visible, Finder-openable ``<name>.lockbox/`` folder:
   vault.meta               JSON header: magic, version, KDF params
                             (salt,n,r,p), verifier tag, creation time, and
                             the name of the blob directory below.
-  <blob-dir>/<uuid>.enc     One encrypted blob per source file. Named after
-                            the source folder for a single-folder encrypt
-                            (e.g. `Secret/`); named `data/` for a combined
-                            multi-folder vault. Blob layout: 12-byte nonce ||
+  data/<uuid>.enc           One encrypted blob per source file. Blob layout:
+                            12-byte nonce ||
                             AES-256-GCM(ciphertext+tag) where the plaintext
                             is: 4-byte big-endian header length || JSON
                             header ({path, size, mtime}) || raw file bytes.
 
 Original filenames and directory structure live entirely inside the encrypted
-blobs; the `Vaulted/` tree is opaque without the password.
+blobs; the ``.lockbox`` tree is opaque without the password.
 
-Encrypting never deletes the source by default (`delete_source=False`) — it
-only creates the encrypted copy. Pass `delete_source=True` to opt into the
-old delete-after-verify behavior.
+Encrypting deletes the source by default, but only after every encrypted blob
+has been written and verified byte-for-byte. Pass `delete_source=False` only
+when a caller explicitly needs a plaintext copy.
 
 Key size defaults to AES-256. Pass `key_bits=128` to `encrypt_folder`/
 `encrypt_folders` for AES-128 instead — fewer AES rounds (10 vs 14) means
@@ -178,12 +176,13 @@ def _iter_files(source: Path) -> Iterable[Path]:
             yield p
 
 
-def _pick_vault_dir(parent: Path) -> Path:
-    base = parent / "Vaulted"
+def _pick_vault_dir(parent: Path, label: str) -> Path:
+    """Return a visible, Finder-openable ``.lockbox`` folder path."""
+    base = parent / f"{label}.lockbox"
     if not base.exists():
         return base
     stamp = time.strftime("%Y-%m-%d_%H%M%S")
-    return parent / f"Vaulted_{stamp}"
+    return parent / f"{label}_{stamp}.lockbox"
 
 
 def _worker_count() -> int:
@@ -303,34 +302,28 @@ def encrypt_folder(
     source: Path,
     password: str,
     progress: Callable[[str, int, int], None] | None = None,
-    delete_source: bool = False,
+    delete_source: bool = True,
     key_bits: int = 256,
-    reveal_folder_name: bool = True,
 ) -> Path:
-    """Encrypt every file under `source` into a sibling `Vaulted/` folder.
+    """Encrypt every file under `source` into a sibling ``.lockbox`` folder.
 
-    The source is left untouched by default — this only creates the
-    encrypted copy. Pass `delete_source=True` to remove the verified
-    originals afterward (write-then-verify-then-delete: each file is
+    Every source file is removed only after the verified
+    write-then-verify-then-delete sequence (each file is
     encrypted to a .tmp, read back and decrypted, compared byte-for-byte,
     then renamed to .enc, and only then removed from source). `key_bits`
     is 256 (default) or 128 — see module docstring.
 
-    File names and contents inside the vault are always encrypted either
-    way. `reveal_folder_name` only controls the one thing that's still
-    plaintext on disk: the blob directory's own name. True (default) names
-    it after `source` (e.g. `Vaulted/Secret/`) so you can tell vaults apart
-    in Finder; False conceals it behind the generic `data/` name instead
-    (same as a combined multi-folder vault uses). Returns the vault
-    directory path.
+    The vault folder carries the source folder's name, while every item
+    inside it is ciphertext.  ``.lockbox`` is registered with the macOS app,
+    so double-clicking the folder opens LockBox and asks for its password.
     """
     _validate_key_bits(key_bits)
     source = source.resolve()
     if not source.is_dir():
         raise LockBoxError(f"Not a directory: {source}")
 
-    data_dir_name = source.name if reveal_folder_name else "data"
-    vault_dir = _pick_vault_dir(source.parent)
+    data_dir_name = "data"
+    vault_dir = _pick_vault_dir(source.parent, source.name)
     data_dir = vault_dir / data_dir_name
     data_dir.mkdir(parents=True, exist_ok=False)
 
@@ -342,7 +335,6 @@ def encrypt_folder(
 
     if delete_source:
         _remove_emptied_source(source)
-
     return vault_dir
 
 
@@ -350,12 +342,12 @@ def encrypt_folders(
     sources: list[Path],
     password: str,
     progress: Callable[[str, int, int], None] | None = None,
-    delete_source: bool = False,
+    delete_source: bool = True,
     key_bits: int = 256,
 ) -> Path:
-    """Encrypt multiple folders into ONE combined sibling `Vaulted/` folder.
+    """Encrypt multiple folders into ONE combined sibling ``.lockbox`` folder.
 
-    Sources are left untouched by default (see `encrypt_folder`). Each
+    Sources are removed after verification by default (see `encrypt_folder`). Each
     folder's files are stored under a `<folder-name>/` prefix inside the
     vault, so `decrypt_vault` recreates them as separate top-level folders.
     Folder names must be distinct (they become that prefix). `key_bits` is
@@ -373,7 +365,7 @@ def encrypt_folders(
     if len(set(names)) != len(names):
         raise LockBoxError("Folders being combined must have distinct names.")
 
-    vault_dir = _pick_vault_dir(sources[0].parent)
+    vault_dir = _pick_vault_dir(sources[0].parent, "Combined Folders")
     data_dir = vault_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=False)
 
@@ -390,8 +382,83 @@ def encrypt_folders(
     if delete_source:
         for src in sources:
             _remove_emptied_source(src)
-
     return vault_dir
+
+
+def encrypt_files(
+    sources: list[Path],
+    password: str,
+    progress: Callable[[str, int, int], None] | None = None,
+    delete_source: bool = True,
+    key_bits: int = 256,
+) -> Path:
+    """Encrypt selected loose files into an ``Enc Files.lockbox`` folder.
+
+    Folder selections retain their own vault folder through ``encrypt_folder``.
+    This path is deliberately separate so loose files never masquerade as a
+    source directory and always land in the predictable Enc Files container.
+    """
+    _validate_key_bits(key_bits)
+    sources = [s.resolve() for s in sources]
+    if not sources:
+        raise LockBoxError("No files given.")
+    if any(not source.is_file() or source.is_symlink() for source in sources):
+        raise LockBoxError("Loose-file encryption accepts regular files only.")
+    names = [source.name for source in sources]
+    if len(set(names)) != len(names):
+        raise LockBoxError("Selected files must have distinct names.")
+
+    parent = Path(os.path.commonpath([str(source.parent) for source in sources]))
+    vault_dir = _pick_vault_dir(parent, "Enc Files")
+    data_dir = vault_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=False)
+    meta, key = _new_meta(password, data_dir_name="data", key_bits=key_bits)
+    (vault_dir / "vault.meta").write_text(meta.to_json(), "utf-8")
+    _encrypt_entries(
+        [(source, source.name) for source in sources], key, data_dir, delete_source, progress
+    )
+    return vault_dir
+
+
+def migrate_legacy_vault(vault_dir: Path) -> Path:
+    """Upgrade a one-folder legacy ``Vaulted/<original-name>/`` vault.
+
+    No ciphertext is decrypted, regenerated, or deleted.  The old payload
+    directory is renamed to anonymous ``data/`` and the outer vault becomes
+    ``<original-name>.lockbox`` beside the old ``Vaulted/`` parent, matching
+    the original input folder's location.  The
+    migration only accepts the old single-payload layout; combined vaults
+    retain their existing shape because there is no single truthful name for
+    their outer folder.
+    """
+    vault_dir = vault_dir.resolve()
+    meta_path = vault_dir / "vault.meta"
+    if not meta_path.is_file():
+        raise LockBoxError(f"vault.meta not found in {vault_dir}")
+    meta = VaultMeta.from_json(meta_path.read_text("utf-8"))
+    old_data_dir = vault_dir / meta.data_dir_name
+    if meta.data_dir_name == "data":
+        raise LockBoxError("This vault already uses the current anonymous layout.")
+    if not old_data_dir.is_dir():
+        raise LockBoxError(f"Legacy payload directory is missing: {meta.data_dir_name}")
+    unexpected = [p.name for p in vault_dir.iterdir() if p.name not in {"vault.meta", meta.data_dir_name}]
+    if unexpected:
+        raise LockBoxError("Legacy vault has unexpected items; refusing to migrate it.")
+    # Old ``Vaulted`` was created beside the input folder, so its parent is
+    # the input location. Keep the upgraded vault beside that input too.
+    destination = _pick_vault_dir(vault_dir.parent, meta.data_dir_name)
+    if destination.exists():
+        raise LockBoxError(f"Destination already exists: {destination.name}")
+
+    # Rename ciphertext first.  If interrupted before the metadata update,
+    # current LockBox can still recognize `data/` as its recovery fallback.
+    old_data_dir.rename(vault_dir / "data")
+    meta.data_dir_name = "data"
+    tmp_meta = vault_dir / "vault.meta.tmp"
+    tmp_meta.write_text(meta.to_json(), "utf-8")
+    os.replace(tmp_meta, meta_path)
+    vault_dir.rename(destination)
+    return destination
 
 
 def _decrypt_one(bpath: Path, key: bytes, destination: Path) -> str:
@@ -427,6 +494,10 @@ def decrypt_vault(
     meta, key = load_meta_and_key(vault_dir, password)
 
     data_dir = vault_dir / meta.data_dir_name
+    # Recovery for an interrupted legacy-layout migration: the payload was
+    # already made anonymous but the metadata update had not landed yet.
+    if not data_dir.is_dir() and (vault_dir / "data").is_dir():
+        data_dir = vault_dir / "data"
     if not data_dir.is_dir():
         raise LockBoxError(f"No {meta.data_dir_name}/ inside {vault_dir}")
 

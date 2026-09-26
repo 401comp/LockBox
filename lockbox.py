@@ -1,8 +1,7 @@
-"""LockBox — folder encryption app.
+"""LockBox — folder and loose-file encryption app.
 
-Drag-in folder → encrypted `Vaulted/` sibling. The verified plaintext source
-is removed by default, so Finder shows the vault rather than its contents.
-Decrypt back to `Unvaulted/`.
+Selected folders become password-openable ``.lockbox`` sibling folders.
+Selected loose files are collected in ``Enc Files.lockbox``.
 Every source file is AES-256-GCM'd with a scrypt-derived key. Filenames and
 directory structure are hidden inside the encrypted blobs.
 """
@@ -25,12 +24,14 @@ from crypto_core import (
     LockBoxError,
     WrongPassword,
     decrypt_vault,
+    encrypt_files,
     encrypt_folder,
     encrypt_folders,
+    migrate_legacy_vault,
 )
 
 APP_NAME = "LockBox"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 # ---------- paths / prefs / history -----------------------------------------
 
@@ -368,6 +369,8 @@ class LockBoxApp:
         self.prefs = load_prefs()
         self._build_menu()
         self._build_ui()
+        self.selected_files: list[Path] = []
+        self._setup_file_open_hooks()
         load_plugins(self)
         self._worker: threading.Thread | None = None
         self._events: queue.Queue = queue.Queue()
@@ -472,6 +475,27 @@ class LockBoxApp:
         if not ok:
             messagebox.showerror(APP_NAME, msg)
 
+    def _setup_file_open_hooks(self) -> None:
+        """Receive Finder Open Document events without py2app argv emulation.
+
+        Tk's native macOS hook works when the app is launched *or* already
+        running.  py2app's argv emulation pre-creates an AppKit application,
+        which collides with Tk's menu setup and crashes on this build.
+        """
+        if sys.platform == "darwin":
+            try:
+                self.root.createcommand("::tk::mac::OpenDocument", self._mac_open_docs)
+            except tk.TclError as exc:
+                applog.warning(f"Could not register Finder open hook: {exc}")
+
+    def _mac_open_docs(self, *paths: str) -> None:
+        for raw_path in paths:
+            path = Path(raw_path).expanduser()
+            if path.is_dir() and self._is_vault(path):
+                applog.info(f"Finder opened vault: {path}")
+                self.root.after_idle(lambda p=path: self.open_vault_from_finder(p))
+                break
+
     def _reveal_log(self) -> None:
         ok, msg = applog.reveal_in_finder()
         if not ok:
@@ -496,19 +520,22 @@ class LockBoxApp:
         ).pack(anchor="w")
         ttk.Label(
             outer,
-            text="Encrypt a folder into an opaque sibling Vaulted/ folder. Decrypt it back.",
+            text="Folders become password-openable LockBox folders; loose files go in Enc Files.",
             foreground="systemSecondaryLabelColor",
         ).pack(anchor="w", pady=(0, 12))
 
         # Folder row
         row = ttk.Frame(outer)
         row.pack(fill="x", pady=4)
-        ttk.Label(row, text="Folder:").pack(side="left")
+        ttk.Label(row, text="Selection:").pack(side="left")
         self.folder_var = tk.StringVar(value=self.prefs.get("last_folder", ""))
         self.folder_entry = ttk.Entry(row, textvariable=self.folder_var)
         self.folder_entry.pack(side="left", fill="x", expand=True, padx=8)
-        self.choose_btn = ttk.Button(row, text="Choose…", command=self._choose_folder)
+        self.folder_entry.bind("<KeyRelease>", self._clear_file_selection_on_edit)
+        self.choose_btn = ttk.Button(row, text="Choose Folder…", command=self._choose_folder)
         self.choose_btn.pack(side="left")
+        self.files_btn = ttk.Button(row, text="Choose Files…", command=self._choose_files)
+        self.files_btn.pack(side="left", padx=(6, 0))
 
         # Combine option — when checked, "Encrypt Folder" prompts for two or
         # more folders (via a picker) and folds them into one vault instead
@@ -526,36 +553,13 @@ class LockBoxApp:
         btn_row = ttk.Frame(outer)
         btn_row.pack(fill="x", pady=(12, 8))
         self.enc_btn = ttk.Button(
-            btn_row, text="Encrypt Folder", width=18, command=self._on_encrypt
+            btn_row, text="Encrypt Selection", width=18, command=self._on_encrypt
         )
         self.enc_btn.pack(side="left")
         self.dec_btn = ttk.Button(
             btn_row, text="Decrypt Vault", width=18, command=self._on_decrypt
         )
         self.dec_btn.pack(side="left", padx=8)
-
-        # The normal lock-up flow replaces the visible plaintext folder with
-        # a verified vault.  Keeping the original is still available for a
-        # backup-first workflow, but must be opted into deliberately.
-        self.delete_source_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            outer,
-            text="Keep the original folder after encrypting",
-            variable=self.delete_source_var,
-        ).pack(anchor="w", pady=(0, 4))
-
-        # Folder-name visibility: file contents and names are always
-        # encrypted; this only controls whether the vault's own top-level
-        # folder is named after the source (visible in Finder) or hidden
-        # behind the generic "data" name. Meaningless in Combine mode
-        # (always concealed there), so it's disabled while that's checked.
-        self.reveal_name_var = tk.BooleanVar(value=False)
-        self.reveal_name_chk = ttk.Checkbutton(
-            outer,
-            text="Show the original folder name inside the vault",
-            variable=self.reveal_name_var,
-        )
-        self.reveal_name_chk.pack(anchor="w", pady=(0, 8))
 
         # Key size: AES-256 is the default; AES-128 has fewer rounds and
         # encrypts faster on large batches, at a reduced (still strong)
@@ -602,7 +606,32 @@ class LockBoxApp:
         initial = self.folder_var.get() or str(Path.home())
         chosen = filedialog.askdirectory(parent=self.root, initialdir=initial)
         if chosen:
+            self.selected_files = []
             self.folder_var.set(chosen)
+
+    def _choose_files(self) -> None:
+        chosen = filedialog.askopenfilenames(parent=self.root, initialdir=str(Path.home()))
+        if not chosen:
+            return
+        self.selected_files = [Path(path).resolve() for path in chosen]
+        count = len(self.selected_files)
+        self.folder_var.set(f"{count} selected file{'s' if count != 1 else ''} → Enc Files.lockbox")
+
+    def _clear_file_selection_on_edit(self, _event=None) -> None:
+        """Typing a folder path must not leave a stale file selection active."""
+        self.selected_files = []
+
+    def open_vault_from_finder(self, path: Path) -> None:
+        """Handle a Finder double-click on a .lockbox folder."""
+        path = path.expanduser().resolve()
+        self.selected_files = []
+        self.combine_var.set(False)
+        self._on_combine_toggle()
+        self.folder_var.set(str(path))
+        if self._is_vault(path):
+            self._on_decrypt()
+        else:
+            messagebox.showerror(APP_NAME, f"'{path.name}' is not a LockBox vault.")
 
     def _validate_folder(self) -> Path | None:
         raw = self.folder_var.get().strip()
@@ -618,17 +647,28 @@ class LockBoxApp:
     def _is_vault(self, path: Path) -> bool:
         return (path / "vault.meta").is_file()
 
+    def _legacy_payload_name(self, path: Path) -> str | None:
+        try:
+            meta = json.loads((path / "vault.meta").read_text("utf-8"))
+            name = str(meta.get("data_dir_name", "data"))
+            return name if name != "data" else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
     def _on_combine_toggle(self) -> None:
         state = "disabled" if self.combine_var.get() else "normal"
         self.folder_entry.configure(state=state)
         self.choose_btn.configure(state=state)
-        self.reveal_name_chk.configure(state=state)
+        self.files_btn.configure(state=state)
 
     def _on_encrypt(self) -> None:
         if self._worker and self._worker.is_alive():
             return
         if self.combine_var.get():
             self._start_combine_flow()
+            return
+        if self.selected_files:
+            self._on_encrypt_files()
             return
         path = self._validate_folder()
         if not path:
@@ -647,18 +687,11 @@ class LockBoxApp:
         if file_count == 0:
             messagebox.showerror(APP_NAME, "No files found inside that folder.")
             return
-        keep_original = self.delete_source_var.get()
-        if not keep_original:
-            note = (
-                "Every file is encrypted and verified first — source files are "
-                "only deleted after the ENTIRE folder has been verified in the "
-                "vault. On success, Finder will show only the encrypted vault. "
-                "A failure partway through leaves the source untouched."
-            )
-        else:
-            note = (
-                "The original folder will stay beside the encrypted vault."
-            )
+        note = (
+            "Every file is encrypted and verified first — source files are "
+            "only deleted after the ENTIRE folder has been verified in the "
+            "vault. A failure partway through leaves the source untouched."
+        )
         if not messagebox.askyesno(
             APP_NAME,
             f"Encrypt {file_count} file(s) from '{path.name}'?\n\n{note}",
@@ -672,10 +705,29 @@ class LockBoxApp:
             self._do_encrypt,
             path,
             dlg.result,
-            not keep_original,
+            True,
             self.key_bits_var.get(),
-            self.reveal_name_var.get(),
         )
+
+    def _on_encrypt_files(self) -> None:
+        files = list(self.selected_files)
+        if not files or any(not path.is_file() for path in files):
+            self.selected_files = []
+            messagebox.showerror(APP_NAME, "Choose one or more existing files first.")
+            return
+        note = (
+            "Every file is encrypted and verified first. The original files are deleted "
+            "only after the whole Enc Files.lockbox vault has verified."
+        )
+        if not messagebox.askyesno(
+            APP_NAME, f"Encrypt {len(files)} selected file(s) into Enc Files.lockbox?\n\n{note}"
+        ):
+            return
+        dlg = PasswordDialog(self.root, "encrypt", "Enc Files")
+        self.root.wait_window(dlg)
+        if dlg.result:
+            self._start_worker(self._do_encrypt_files, files, dlg.result, True,
+                               self.key_bits_var.get())
 
     def _on_decrypt(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -689,6 +741,20 @@ class LockBoxApp:
                 f"'{path.name}' is not a LockBox vault (missing vault.meta).",
             )
             return
+        legacy_name = self._legacy_payload_name(path)
+        if legacy_name and messagebox.askyesno(
+            APP_NAME,
+            f"This is the old Vaulted/{legacy_name} layout.\n\n"
+            f"Upgrade it to {legacy_name}.lockbox now? This only renames the "
+            "encrypted container and makes its payload anonymous; it does not "
+            "decrypt, alter, or delete any encrypted files.",
+        ):
+            try:
+                path = migrate_legacy_vault(path)
+                self.folder_var.set(str(path))
+            except LockBoxError as exc:
+                messagebox.showerror(APP_NAME, f"Could not upgrade vault:\n{exc}")
+                return
         dlg = PasswordDialog(self.root, "decrypt", path.name)
         self.root.wait_window(dlg)
         if not dlg.result:
@@ -711,18 +777,11 @@ class LockBoxApp:
             messagebox.showerror(APP_NAME, "No files found inside those folders.")
             return
         names = ", ".join(f.name for f in folders)
-        keep_original = self.delete_source_var.get()
-        if not keep_original:
-            note = (
-                "Every file is encrypted and verified first — source files are "
-                "only deleted after ALL folders have been fully verified in "
-                "the vault. On success, Finder will show only the encrypted vault. "
-                "A failure partway through leaves everything untouched."
-            )
-        else:
-            note = (
-                "The original folders will stay beside the encrypted vault."
-            )
+        note = (
+            "Every file is encrypted and verified first — source files are "
+            "only deleted after ALL folders have been fully verified in "
+            "the vault. A failure partway through leaves everything untouched."
+        )
         if not messagebox.askyesno(
             APP_NAME,
             f"Combine {len(folders)} folders ({file_count} file(s) total) into one vault?\n\n"
@@ -734,7 +793,7 @@ class LockBoxApp:
         if not pw_dlg.result:
             return
         self._start_worker(
-            self._do_combine, folders, pw_dlg.result, not keep_original, self.key_bits_var.get()
+            self._do_combine, folders, pw_dlg.result, True, self.key_bits_var.get()
         )
 
     # Worker plumbing --------------------------------------------------------
@@ -743,6 +802,7 @@ class LockBoxApp:
         self.enc_btn.configure(state="disabled")
         self.dec_btn.configure(state="disabled")
         self.combine_chk.configure(state="disabled")
+        self.files_btn.configure(state="disabled")
         self.progress.configure(value=0, maximum=100)
         self.status_var.set("Working…")
         self._log_clear()
@@ -757,7 +817,6 @@ class LockBoxApp:
         password: str,
         delete_source: bool = False,
         key_bits: int = 256,
-        reveal_folder_name: bool = True,
     ) -> None:
         def prog(name: str, cur: int, total: int) -> None:
             self._events.put(("progress", name, cur, total))
@@ -768,15 +827,29 @@ class LockBoxApp:
                 progress=prog,
                 delete_source=delete_source,
                 key_bits=key_bits,
-                reveal_folder_name=reveal_folder_name,
             )
             count = sum(1 for _ in vault.rglob("*.enc"))
             self._events.put(("done", "encrypt", path, vault, count, None, delete_source))
         except Exception as exc:  # noqa: BLE001
             applog.exception(f"encrypt failed for {path}")
             self._events.put(
-                ("done", "encrypt", path, path.parent / "Vaulted", 0, exc, delete_source)
+                ("done", "encrypt", path, path.parent / f"{path.name}.lockbox", 0, exc, delete_source)
             )
+
+    def _do_encrypt_files(
+        self, files: list[Path], password: str, delete_source: bool = False, key_bits: int = 256
+    ) -> None:
+        def prog(name: str, cur: int, total: int) -> None:
+            self._events.put(("progress", name, cur, total))
+        try:
+            vault = encrypt_files(files, password, progress=prog, delete_source=delete_source,
+                                  key_bits=key_bits)
+            count = sum(1 for _ in vault.rglob("*.enc"))
+            self._events.put(("done", "encrypt", "Enc Files", vault, count, None, delete_source))
+        except Exception as exc:  # noqa: BLE001
+            applog.exception("encrypt failed for selected files")
+            self._events.put(("done", "encrypt", "Enc Files", Path.cwd() / "Enc Files.lockbox",
+                              0, exc, delete_source))
 
     def _do_decrypt(self, path: Path, password: str) -> None:
         def prog(name: str, cur: int, total: int) -> None:
@@ -808,7 +881,7 @@ class LockBoxApp:
         except Exception as exc:  # noqa: BLE001
             applog.exception(f"combine-encrypt failed for {desc}")
             self._events.put(
-                ("done", "encrypt", desc, folders[0].parent / "Vaulted", 0, exc, delete_source)
+                ("done", "encrypt", desc, folders[0].parent / "Combined Folders.lockbox", 0, exc, delete_source)
             )
 
     # Event pump -------------------------------------------------------------
@@ -836,6 +909,7 @@ class LockBoxApp:
                     self.enc_btn.configure(state="normal")
                     self.dec_btn.configure(state="normal")
                     self.combine_chk.configure(state="normal")
+                    self.files_btn.configure(state="normal")
                     if exc is None:
                         self.status_var.set(f"{action.title()} complete → {out.name}")
                         self._log_add(f"Done. {count} file(s) → {out}")
@@ -914,26 +988,17 @@ def _self_test() -> int:
 
         password = "correct horse battery staple"
 
-        # Default: source is left untouched, blob dir named after the folder.
+        # A selected folder becomes a same-named, Finder-openable vault folder;
+        # plaintext disappears only after the entire verified write completes.
         vault = encrypt_folder(src, password)
         assert vault.is_dir(), "vault dir not created"
+        assert vault.name == "Secret.lockbox", "folder vault name is not stable"
         assert (vault / "vault.meta").is_file(), "no vault.meta"
-        assert src.exists(), "source was deleted despite delete_source defaulting to False"
-        assert (vault / "Secret").is_dir(), "blob dir not named after source folder"
+        assert not src.exists(), "source survived despite default verified deletion"
+        assert (vault / "data").is_dir(), "vault data folder missing"
+        assert not (vault / "Secret").exists(), "source name leaked inside vault"
         meta = json.loads((vault / "vault.meta").read_text("utf-8"))
         assert meta["key_bits"] == 256, "key_bits did not default to 256"
-
-        # reveal_folder_name=False conceals the folder name behind "data".
-        src_hidden = tmp / "TopSecretProject"
-        src_hidden.mkdir()
-        (src_hidden / "f.txt").write_bytes(b"shh")
-        vault_hidden = encrypt_folder(src_hidden, password, reveal_folder_name=False)
-        assert (vault_hidden / "data").is_dir(), "concealed encrypt did not use 'data'"
-        assert not (vault_hidden / "TopSecretProject").exists(), (
-            "concealed encrypt leaked the source folder name"
-        )
-        out_hidden = decrypt_vault(vault_hidden, password, destination=tmp / "RestoredHidden")
-        assert (out_hidden / "f.txt").read_bytes() == b"shh"
 
         # Wrong password should fail
         try:
@@ -948,12 +1013,50 @@ def _self_test() -> int:
         assert (out / "sub" / "utf.txt").read_text("utf-8") == "héllo — üñïçødé"
         assert (out / "sub" / "a.bin").stat().st_size == 4096
 
-        # Explicit delete_source=True still works (opt-in legacy behavior).
+        # Loose files always get their own Enc Files.lockbox container.
+        loose_a = tmp / "receipt.pdf"
+        loose_b = tmp / "notes.txt"
+        loose_a.write_bytes(b"receipt")
+        loose_b.write_bytes(b"notes")
+        files_vault = encrypt_files([loose_a, loose_b], password)
+        assert files_vault.name == "Enc Files.lockbox", "loose files missed Enc Files container"
+        assert not loose_a.exists() and not loose_b.exists(), "loose files survived verified deletion"
+        files_out = decrypt_vault(files_vault, password, destination=tmp / "RestoredFiles")
+        assert (files_out / "receipt.pdf").read_bytes() == b"receipt"
+        assert (files_out / "notes.txt").read_bytes() == b"notes"
+
+        # Legacy Vaulted/<source-name>/ upgrades without touching ciphertext.
+        legacy_root = tmp / "Vaulted"
+        legacy_root.mkdir()
+        legacy_data = legacy_root / "LegacyName"
+        legacy_data.mkdir()
+        loose_a.write_bytes(b"receipt")
+        legacy_meta, legacy_key = __import__("crypto_core")._new_meta(
+            password, data_dir_name="LegacyName"
+        )
+        (legacy_root / "vault.meta").write_text(legacy_meta.to_json(), "utf-8")
+        __import__("crypto_core")._encrypt_entries(
+            [(loose_a, loose_a.name)], legacy_key, legacy_data, False, None
+        )
+        blob_before = {p.name: p.read_bytes() for p in legacy_data.glob("*.enc")}
+        upgraded = migrate_legacy_vault(legacy_root)
+        assert upgraded.name == "LegacyName.lockbox", "legacy vault name was not upgraded"
+        assert upgraded.parent == legacy_root.parent.resolve(), (
+            "legacy vault did not return beside the original input location"
+        )
+        assert (upgraded / "data").is_dir(), "legacy payload was not anonymized"
+        assert {p.name: p.read_bytes() for p in (upgraded / "data").glob("*.enc")} == blob_before, (
+            "legacy migration altered ciphertext"
+        )
+        legacy_out = decrypt_vault(upgraded, password, destination=tmp / "RestoredLegacy")
+        assert (legacy_out / "receipt.pdf").read_bytes() == b"receipt"
+
+        # Explicit keep-source mode remains available to API callers.
         src2 = tmp / "SecretToDelete"
         src2.mkdir()
         (src2 / "f.txt").write_bytes(b"gone")
-        vault2 = encrypt_folder(src2, password, delete_source=True)
-        assert not src2.exists(), "delete_source=True did not remove source"
+        vault2 = encrypt_folder(src2, password, delete_source=False)
+        assert src2.exists(), "delete_source=False did not retain source"
         decrypt_vault(vault2, password, destination=tmp / "Restored2")
         assert (tmp / "Restored2" / "f.txt").read_bytes() == b"gone"
 
@@ -985,9 +1088,7 @@ def _self_test() -> int:
         (src_b / "b.txt").write_bytes(b"beta")
 
         combo_vault = encrypt_folders([src_a, src_b], password)
-        assert src_a.exists() and src_b.exists(), (
-            "combine deleted source despite delete_source defaulting to False"
-        )
+        assert not src_a.exists() and not src_b.exists(), "combine did not delete verified sources"
 
         combo_out = decrypt_vault(combo_vault, password, destination=tmp / "Combined")
         assert (combo_out / "AlphaFolder" / "a.txt").read_bytes() == b"alpha"
@@ -1025,7 +1126,12 @@ def main() -> int:
         return _self_test()
     root = tk.Tk()
     ttk.Style(root).theme_use("aqua")  # inherits system Light/Dark automatically
-    LockBoxApp(root)
+    app = LockBoxApp(root)
+    finder_path = next(
+        (Path(arg) for arg in sys.argv[1:] if Path(arg).expanduser().is_dir()), None
+    )
+    if finder_path is not None:
+        root.after(120, lambda: app.open_vault_from_finder(finder_path))
     root.mainloop()
     return 0
 

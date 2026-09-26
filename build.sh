@@ -12,7 +12,7 @@ cd "$HERE"
 VENV="$HERE/.venv"
 PY="$VENV/bin/python"
 APP_NAME="LockBox"
-APP_VERSION="1.0.1"
+APP_VERSION="1.1.0"
 APP_BUNDLE="dist/$APP_NAME.app"
 DMG_PATH="dist/${APP_NAME}.dmg"
 

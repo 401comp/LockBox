@@ -1,9 +1,9 @@
 # LockBox
 
-Folder-level encryption for macOS. Pick a folder, give it a password, and
-LockBox replaces it with a sibling `Vaulted/` folder that hides every file —
-including their names and directory structure. Decrypt back with the same
-password.
+Folder and loose-file encryption for macOS. Pick a folder, give it a password,
+and LockBox creates a sibling `FolderName.lockbox` folder. Double-click that
+folder in Finder to launch LockBox and enter its password. When you select
+individual files instead, LockBox puts them in `Enc Files.lockbox`.
 
 Unlike full-disk (FileVault) or container-mount (VeraCrypt) tools, LockBox
 operates at folder granularity: you point it at exactly what you want
@@ -11,12 +11,11 @@ protected, and the rest of your disk stays untouched.
 
 ## What it does
 
-- **Encrypts a folder** into a sibling `Vaulted/` — random-UUID `.enc` blobs
-  under `Vaulted/data/`, plus a small `vault.meta` header. Original filenames
+- **Encrypts a selected folder** into a same-named sibling `.lockbox` folder —
+  random-UUID `.enc` blobs under `data/`, plus a small `vault.meta` header. Original filenames
   and folder structure live *inside* the encrypted blobs. After every file is
   encrypted and verified, the source folder is removed by default, leaving
-  only the opaque vault in Finder. Check **Keep the original folder after
-  encrypting** to retain a plaintext copy.
+  only the opaque vault in Finder. A failure leaves the source intact.
 - **Decrypts a vault** back into a sibling `Unvaulted/`, reconstructing the
   original tree (paths and mtimes preserved).
 - **Prompts for a password every time** — nothing is stored in the Keychain.
@@ -31,7 +30,9 @@ protected, and the rest of your disk stays untouched.
 - **Verifier**: encrypted marker in `vault.meta` — wrong passwords are
   rejected before any file is touched.
 - **Filename hiding**: original path/size/mtime live in an authenticated
-  header inside each blob. The `Vaulted/` tree is opaque without the key.
+  header inside each blob. The `.lockbox` tree is opaque without the key.
+- **Finder opening**: `.lockbox` is registered with LockBox, so a double-click
+  prompts for the vault password instead of exposing an ordinary working folder.
 
 ## Safety notes
 
@@ -40,28 +41,31 @@ protected, and the rest of your disk stays untouched.
 - **Encrypt over a copy the first time** until you trust the round-trip.
 - LockBox uses `os.remove()` on originals — it does not do secure-erase
   overwrites (a modern SSD's wear-leveling makes that mostly theatre anyway).
+- A vault's manifest and ciphertext blobs remain visible to a shell or to
+  Finder's “Show Hidden Files” setting, but they are encrypted data—not hidden
+  plaintext—and cannot reveal the original files without the password.
 
 ## Usage
 
 1. Launch LockBox.
-2. Pick a folder.
-3. Click **Encrypt Folder** → enter a password twice.
-4. To decrypt: pick the `Vaulted/` folder → **Decrypt Vault** → password.
+2. Pick a folder, or click **Choose Files…** for loose files.
+3. Click **Encrypt Selection** → enter a password twice.
+4. To decrypt: double-click the `.lockbox` folder, or choose it in LockBox.
 
 Output goes next to the input:
 
 ```
 Documents/
   Secret/               ← removed after successful encrypt (the default)
-  Vaulted/              ← new; opaque
+  Secret.lockbox/       ← new, double-click to prompt for password
     vault.meta
     data/
       3f9a…e1.enc
       7c02…88.enc
 ```
 
-If `Vaulted/` already exists at that location, a timestamped variant is used
-(`Vaulted_2026-08-14_143512/`).
+If that vault name already exists, LockBox uses a timestamped `.lockbox`
+variant. Loose files always use `Enc Files.lockbox`.
 
 ## Build
 
