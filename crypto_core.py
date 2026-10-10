@@ -49,6 +49,9 @@ KEY_LEN = 32
 SALT_LEN = 16
 NONCE_LEN = 12
 VERIFIER_PT = b"lockbox-verify-v1"
+FILE_MAGIC = b"LOCKBOX-FILE-1\0"
+FILE_HEADER_LEN = struct.Struct(">I")
+FILE_RECORD_LEN = struct.Struct(">Q")
 
 
 class LockBoxError(Exception):
@@ -151,6 +154,44 @@ def load_meta_and_key(vault_dir: Path, password: str) -> tuple[VaultMeta, bytes]
     return meta, key
 
 
+def _load_file_meta_and_key(vault_file: Path, password: str) -> tuple[VaultMeta, bytes, int]:
+    """Load the unencrypted format header of a single-file vault.
+
+    The header holds only KDF and password-verifier data.  Every original name,
+    path, timestamp, and file byte remains inside individually authenticated
+    encrypted records after it.
+    """
+    try:
+        with vault_file.open("rb") as handle:
+            if handle.read(len(FILE_MAGIC)) != FILE_MAGIC:
+                raise LockBoxError("Not a single-file LockBox vault")
+            raw_len = handle.read(FILE_HEADER_LEN.size)
+            if len(raw_len) != FILE_HEADER_LEN.size:
+                raise LockBoxError("Single-file vault header is incomplete")
+            (header_len,) = FILE_HEADER_LEN.unpack(raw_len)
+            if header_len < 2 or header_len > 1024 * 1024:
+                raise LockBoxError("Single-file vault header has an invalid size")
+            raw_meta = handle.read(header_len)
+            if len(raw_meta) != header_len:
+                raise LockBoxError("Single-file vault header is incomplete")
+            offset = handle.tell()
+    except OSError as exc:
+        raise LockBoxError(f"Could not read vault: {exc}") from exc
+
+    try:
+        meta = VaultMeta.from_json(raw_meta.decode("utf-8"))
+    except Exception as exc:
+        raise LockBoxError("Vault is damaged or was modified (invalid header).") from exc
+    key = derive_key(password, meta.salt, meta.n, meta.r, meta.p, meta.key_bits // 8)
+    try:
+        verified = AESGCM(key).decrypt(meta.verifier_nonce, meta.verifier, None)
+    except Exception as exc:
+        raise WrongPassword("Password does not match this vault") from exc
+    if verified != VERIFIER_PT:
+        raise WrongPassword("Password does not match this vault")
+    return meta, key, offset
+
+
 def _encrypt_bytes(key: bytes, header: dict, payload: bytes) -> bytes:
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
     plaintext = struct.pack(">I", len(header_bytes)) + header_bytes + payload
@@ -183,6 +224,95 @@ def _pick_vault_dir(parent: Path, label: str) -> Path:
         return base
     stamp = time.strftime("%Y-%m-%d_%H%M%S")
     return parent / f"{label}_{stamp}.lockbox"
+
+
+def _pick_vault_file(parent: Path, label: str) -> Path:
+    """Return an unused, opaque single-file vault path."""
+    return _pick_vault_dir(parent, label)
+
+
+def _validate_vault_file_path(vault_file: Path) -> Path:
+    vault_file = vault_file.expanduser().resolve()
+    if vault_file.exists():
+        raise LockBoxError(f"A file already exists at: {vault_file}")
+    if vault_file.suffix.lower() != ".lockbox":
+        raise LockBoxError("Single-file vault names must end in .lockbox")
+    if not vault_file.parent.is_dir():
+        raise LockBoxError(f"Vault destination folder does not exist: {vault_file.parent}")
+    return vault_file
+
+
+def _write_file_vault(
+    entries: list[tuple[Path, str]],
+    password: str,
+    vault_file: Path,
+    delete_source: bool,
+    progress: Callable[[str, int, int], None] | None,
+    key_bits: int,
+) -> Path:
+    """Create, verify, then atomically publish one opaque vault file."""
+    if not entries:
+        raise LockBoxError("No files to encrypt.")
+    vault_file = _validate_vault_file_path(vault_file)
+    meta, key = _new_meta(password, data_dir_name="", key_bits=key_bits)
+    tmp_file = vault_file.with_name(vault_file.name + ".tmp")
+    if tmp_file.exists():
+        raise LockBoxError(f"Temporary vault file already exists: {tmp_file}")
+    total = len(entries)
+    verified = False
+    try:
+        with tmp_file.open("xb") as handle:
+            meta_bytes = meta.to_json().encode("utf-8")
+            handle.write(FILE_MAGIC)
+            handle.write(FILE_HEADER_LEN.pack(len(meta_bytes)))
+            handle.write(meta_bytes)
+            for idx, (source, rel) in enumerate(entries, start=1):
+                payload = source.read_bytes()
+                header = {"path": rel, "size": len(payload), "mtime": source.stat().st_mtime}
+                blob = _encrypt_bytes(key, header, payload)
+                handle.write(FILE_RECORD_LEN.pack(len(blob)))
+                handle.write(blob)
+                if progress:
+                    progress(rel, idx, total)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        os.replace(tmp_file, vault_file)
+        _, verify_key, offset = _load_file_meta_and_key(vault_file, password)
+        with vault_file.open("rb") as handle:
+            handle.seek(offset)
+            for source, expected_rel in entries:
+                raw_len = handle.read(FILE_RECORD_LEN.size)
+                if len(raw_len) != FILE_RECORD_LEN.size:
+                    raise LockBoxError("Vault verification found a missing encrypted record")
+                (blob_len,) = FILE_RECORD_LEN.unpack(raw_len)
+                blob = handle.read(blob_len)
+                if len(blob) != blob_len:
+                    raise LockBoxError("Vault verification found a truncated encrypted record")
+                header, payload = _decrypt_bytes(verify_key, blob)
+                if header.get("path") != expected_rel or payload != source.read_bytes():
+                    raise LockBoxError(f"Vault verification failed for {expected_rel}; source left intact")
+            if handle.read(1):
+                raise LockBoxError("Vault verification found unexpected trailing data")
+
+        verified = True
+        if delete_source:
+            if progress:
+                progress("deleting", 0, total)
+            for idx, (source, _rel) in enumerate(entries, start=1):
+                source.unlink()
+                if progress:
+                    progress("deleting", idx, total)
+        if progress:
+            progress("done", total, total)
+        return vault_file
+    except Exception:
+        tmp_file.unlink(missing_ok=True)
+        # A failed verification must never leave an ambiguous, apparently
+        # successful final vault beside untouched source files.
+        if not verified:
+            vault_file.unlink(missing_ok=True)
+        raise
 
 
 def _worker_count() -> int:
@@ -302,58 +432,34 @@ def encrypt_folder(
     source: Path,
     password: str,
     progress: Callable[[str, int, int], None] | None = None,
-    delete_source: bool = True,
+    delete_source: bool = False,
     key_bits: int = 256,
+    vault_file: Path | None = None,
 ) -> Path:
-    """Encrypt every file under `source` into a sibling ``.lockbox`` folder.
-
-    Every source file is removed only after the verified
-    write-then-verify-then-delete sequence (each file is
-    encrypted to a .tmp, read back and decrypted, compared byte-for-byte,
-    then renamed to .enc, and only then removed from source). `key_bits`
-    is 256 (default) or 128 — see module docstring.
-
-    The vault folder carries the source folder's name, while every item
-    inside it is ciphertext.  ``.lockbox`` is registered with the macOS app,
-    so double-clicking the folder opens LockBox and asks for its password.
-    """
+    """Encrypt every file under `source` into one opaque ``.lockbox`` file."""
     _validate_key_bits(key_bits)
     source = source.resolve()
     if not source.is_dir():
         raise LockBoxError(f"Not a directory: {source}")
 
-    data_dir_name = "data"
-    vault_dir = _pick_vault_dir(source.parent, source.name)
-    data_dir = vault_dir / data_dir_name
-    data_dir.mkdir(parents=True, exist_ok=False)
-
-    meta, key = _new_meta(password, data_dir_name=data_dir_name, key_bits=key_bits)
-    (vault_dir / "vault.meta").write_text(meta.to_json(), "utf-8")
-
     entries = [(f, f.relative_to(source).as_posix()) for f in _iter_files(source)]
-    _encrypt_entries(entries, key, data_dir, delete_source, progress)
+    vault_file = vault_file or _pick_vault_file(source.parent, source.name)
+    result = _write_file_vault(entries, password, vault_file, delete_source, progress, key_bits)
 
     if delete_source:
         _remove_emptied_source(source)
-    return vault_dir
+    return result
 
 
 def encrypt_folders(
     sources: list[Path],
     password: str,
     progress: Callable[[str, int, int], None] | None = None,
-    delete_source: bool = True,
+    delete_source: bool = False,
     key_bits: int = 256,
+    vault_file: Path | None = None,
 ) -> Path:
-    """Encrypt multiple folders into ONE combined sibling ``.lockbox`` folder.
-
-    Sources are removed after verification by default (see `encrypt_folder`). Each
-    folder's files are stored under a `<folder-name>/` prefix inside the
-    vault, so `decrypt_vault` recreates them as separate top-level folders.
-    Folder names must be distinct (they become that prefix). `key_bits` is
-    256 (default) or 128 — see module docstring. The vault is created next
-    to the first folder in `sources`.
-    """
+    """Encrypt multiple folders into one opaque ``.lockbox`` file."""
     _validate_key_bits(key_bits)
     sources = [s.resolve() for s in sources]
     if not sources:
@@ -365,39 +471,29 @@ def encrypt_folders(
     if len(set(names)) != len(names):
         raise LockBoxError("Folders being combined must have distinct names.")
 
-    vault_dir = _pick_vault_dir(sources[0].parent, "Combined Folders")
-    data_dir = vault_dir / "data"
-    data_dir.mkdir(parents=True, exist_ok=False)
-
-    meta, key = _new_meta(password, key_bits=key_bits)
-    (vault_dir / "vault.meta").write_text(meta.to_json(), "utf-8")
-
     entries = [
         (f, (Path(src.name) / f.relative_to(src)).as_posix())
         for src in sources
         for f in _iter_files(src)
     ]
-    _encrypt_entries(entries, key, data_dir, delete_source, progress)
+    vault_file = vault_file or _pick_vault_file(sources[0].parent, "Combined Folders")
+    result = _write_file_vault(entries, password, vault_file, delete_source, progress, key_bits)
 
     if delete_source:
         for src in sources:
             _remove_emptied_source(src)
-    return vault_dir
+    return result
 
 
 def encrypt_files(
     sources: list[Path],
     password: str,
     progress: Callable[[str, int, int], None] | None = None,
-    delete_source: bool = True,
+    delete_source: bool = False,
     key_bits: int = 256,
+    vault_file: Path | None = None,
 ) -> Path:
-    """Encrypt selected loose files into an ``Enc Files.lockbox`` folder.
-
-    Folder selections retain their own vault folder through ``encrypt_folder``.
-    This path is deliberately separate so loose files never masquerade as a
-    source directory and always land in the predictable Enc Files container.
-    """
+    """Encrypt selected loose files into one opaque ``.lockbox`` file."""
     _validate_key_bits(key_bits)
     sources = [s.resolve() for s in sources]
     if not sources:
@@ -409,15 +505,11 @@ def encrypt_files(
         raise LockBoxError("Selected files must have distinct names.")
 
     parent = Path(os.path.commonpath([str(source.parent) for source in sources]))
-    vault_dir = _pick_vault_dir(parent, "Enc Files")
-    data_dir = vault_dir / "data"
-    data_dir.mkdir(parents=True, exist_ok=False)
-    meta, key = _new_meta(password, data_dir_name="data", key_bits=key_bits)
-    (vault_dir / "vault.meta").write_text(meta.to_json(), "utf-8")
-    _encrypt_entries(
-        [(source, source.name) for source in sources], key, data_dir, delete_source, progress
+    vault_file = vault_file or _pick_vault_file(parent, "Enc Files")
+    return _write_file_vault(
+        [(source, source.name) for source in sources], password, vault_file,
+        delete_source, progress, key_bits,
     )
-    return vault_dir
 
 
 def migrate_legacy_vault(vault_dir: Path) -> Path:
@@ -483,14 +575,100 @@ def _decrypt_one(bpath: Path, key: bytes, destination: Path) -> str:
     return rel
 
 
+def _pick_unvaulted_destination(vault_path: Path, destination: Path | None) -> Path:
+    if destination is not None:
+        return destination
+    base = vault_path.parent / "Unvaulted"
+    candidate = base
+    n = 1
+    while candidate.exists():
+        n += 1
+        candidate = vault_path.parent / f"Unvaulted_{n}"
+    return candidate
+
+
+def _decrypt_file_vault(
+    vault_file: Path,
+    password: str,
+    destination: Path | None,
+    progress: Callable[[str, int, int], None] | None,
+) -> Path:
+    """Decrypt a single-file vault with authenticated, corruption-safe reads."""
+    _meta, key, offset = _load_file_meta_and_key(vault_file, password)
+    records: list[bytes] = []
+    try:
+        with vault_file.open("rb") as handle:
+            handle.seek(offset)
+            while True:
+                raw_len = handle.read(FILE_RECORD_LEN.size)
+                if not raw_len:
+                    break
+                if len(raw_len) != FILE_RECORD_LEN.size:
+                    raise LockBoxError("Vault is damaged or was modified (truncated record length).")
+                (blob_len,) = FILE_RECORD_LEN.unpack(raw_len)
+                if blob_len < NONCE_LEN + 4 or blob_len > 1024 * 1024 * 1024 * 8:
+                    raise LockBoxError("Vault is damaged or was modified (invalid record length).")
+                blob = handle.read(blob_len)
+                if len(blob) != blob_len:
+                    raise LockBoxError("Vault is damaged or was modified (truncated encrypted record).")
+                records.append(blob)
+    except OSError as exc:
+        raise LockBoxError(f"Could not read vault: {exc}") from exc
+
+    destination = _pick_unvaulted_destination(vault_file, destination)
+    destination.mkdir(parents=True, exist_ok=False)
+    total = len(records)
+    if progress:
+        progress("scan", 0, total)
+    try:
+        for idx, blob in enumerate(records, start=1):
+            try:
+                header, payload = _decrypt_bytes(key, blob)
+            except Exception as exc:
+                raise LockBoxError("Vault is damaged or was modified; no more files were restored.") from exc
+            rel = str(header.get("path", ""))
+            if not rel:
+                raise LockBoxError("Vault is damaged or was modified (missing encrypted path).")
+            out_path = (destination / rel).resolve()
+            if not str(out_path).startswith(str(destination.resolve())):
+                raise LockBoxError("Vault is damaged or was modified (unsafe encrypted path).")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(payload)
+            try:
+                mtime = float(header.get("mtime", 0))
+                if mtime:
+                    os.utime(out_path, (mtime, mtime))
+            except OSError:
+                pass
+            if progress:
+                progress(rel, idx, total)
+    except Exception:
+        # Do not leave a partial plaintext restore after an authenticity failure.
+        for path in sorted(destination.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            try:
+                path.unlink() if path.is_file() else path.rmdir()
+            except OSError:
+                pass
+        try:
+            destination.rmdir()
+        except OSError:
+            pass
+        raise
+    if progress:
+        progress("done", total, total)
+    return destination
+
+
 def decrypt_vault(
     vault_dir: Path,
     password: str,
     destination: Path | None = None,
     progress: Callable[[str, int, int], None] | None = None,
 ) -> Path:
-    """Decrypt `vault_dir` into a sibling `Unvaulted/` folder (or given path)."""
+    """Decrypt either a current single-file vault or a legacy folder vault."""
     vault_dir = vault_dir.resolve()
+    if vault_dir.is_file():
+        return _decrypt_file_vault(vault_dir, password, destination, progress)
     meta, key = load_meta_and_key(vault_dir, password)
 
     data_dir = vault_dir / meta.data_dir_name
@@ -501,13 +679,7 @@ def decrypt_vault(
     if not data_dir.is_dir():
         raise LockBoxError(f"No {meta.data_dir_name}/ inside {vault_dir}")
 
-    if destination is None:
-        base = vault_dir.parent / "Unvaulted"
-        destination = base
-        n = 1
-        while destination.exists():
-            n += 1
-            destination = vault_dir.parent / f"Unvaulted_{n}"
+    destination = _pick_unvaulted_destination(vault_dir, destination)
     destination.mkdir(parents=True, exist_ok=False)
 
     blobs = sorted(data_dir.glob("*.enc"))
