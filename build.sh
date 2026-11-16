@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # LockBox build script.
 #
-# Creates a local venv (Homebrew python3.14), installs deps, runs the
+# Creates a local venv from a python.org framework Python, installs deps, runs the
 # self-test, builds a py2app .app, verifies cross-Mac portability with
 # otool -L, and packages a DMG.
 set -euo pipefail
@@ -17,7 +17,7 @@ APP_BUNDLE="dist/$APP_NAME.app"
 DMG_PATH="dist/${APP_NAME}.dmg"
 
 # Find a usable non-conda Python 3.9+. Prefer python.org framework installer
-# (always includes _tkinter), fall back to Homebrew if present, then PATH.
+# (always includes _tkinter), then use a non-conda PATH Python.
 # Reject conda: its libffi/tcl/tk are @rpath-linked and py2app can't bundle
 # them, so the built app crashes on launch (dlopen: Library not loaded:
 # @rpath/libffi.8.dylib).
@@ -25,12 +25,6 @@ find_python() {
   local cand real
   for v in 3.14 3.13 3.12 3.11 3.10 3.9; do
     cand="/Library/Frameworks/Python.framework/Versions/$v/bin/python$v"
-    [ -x "$cand" ] && echo "$cand" && return 0
-  done
-  for v in 3.14 3.13 3.12 3.11 3.10; do
-    cand="/usr/local/opt/python@$v/bin/python$v"
-    [ -x "$cand" ] && echo "$cand" && return 0
-    cand="/opt/homebrew/opt/python@$v/bin/python$v"
     [ -x "$cand" ] && echo "$cand" && return 0
   done
   if command -v python3 >/dev/null 2>&1; then
@@ -45,7 +39,7 @@ find_python() {
 
 BOOTSTRAP=$(find_python) || {
   echo "ERROR: no usable non-conda Python 3.9+ found." >&2
-  echo "       Install python.org 3.12+ or Homebrew python@3.14." >&2
+  echo "       Install a current framework Python from python.org." >&2
   exit 1
 }
 echo "==> Python: $BOOTSTRAP ($("$BOOTSTRAP" --version))"
@@ -77,11 +71,11 @@ echo "==> Installing runtime deps"
 # --only-binary forces a real prebuilt wheel. Without it, if pip's local
 # cache or resolver ever falls back to building cryptography's Rust
 # extension from source, it links against whatever OpenSSL happens to be
-# on THIS machine (Homebrew's) instead of the vendored one official wheels
+# on the build machine instead of the vendored one official wheels
 # ship — same @rpath leak class as the conda libffi problem above, just
 # from a different toolchain. Seen 2026-08-31: a locally-built 2MB wheel
 # in the pip cache (vs. ~8MB for the real universal2 wheel) silently linked
-# to /usr/local/opt/openssl@3.
+# to an external OpenSSL installation.
 "$PY" -m pip install --quiet --only-binary=:all: 'cryptography>=42'
 
 echo "==> Installing build deps"
@@ -89,7 +83,7 @@ echo "==> Installing build deps"
 
 echo "==> Checking for tkinter"
 "$PY" -c 'import tkinter' || {
-  echo "ERROR: this Python has no tkinter. On Homebrew: brew install python-tk@3.14" >&2
+  echo "ERROR: this Python has no tkinter. Use a framework Python from python.org." >&2
   exit 1
 }
 
@@ -107,23 +101,23 @@ if [[ ! -d "$APP_BUNDLE" ]]; then
   exit 1
 fi
 
-echo "==> Checking bundled Python for Homebrew leaks (otool -L)"
+echo "==> Checking bundled Python for external library links (otool -L)"
 BUNDLED_PY="$APP_BUNDLE/Contents/MacOS/python"
 if [[ -x "$BUNDLED_PY" ]]; then
-  if otool -L "$BUNDLED_PY" | grep -E '/usr/local/|/opt/homebrew/' >/dev/null; then
-    echo "!! Bundled python links to Homebrew paths — will not launch on clean Macs:" >&2
-    otool -L "$BUNDLED_PY" | grep -E '/usr/local/|/opt/homebrew/' >&2
+  if otool -L "$BUNDLED_PY" | awk '/^[[:space:]]+\// && $1 !~ "^/usr/lib/" && $1 !~ "^/System/Library/" {found=1} END {exit !found}'; then
+    echo "!! Bundled Python links to an external non-system path:" >&2
+    otool -L "$BUNDLED_PY" >&2
     exit 2
   fi
-  echo "   bundled python: OK (no /usr/local or /opt/homebrew links)"
+  echo "   bundled Python: OK (no external non-system links)"
 fi
 
 # Scan .so files inside the bundle for the same leak.
 LEAK=0
 while IFS= read -r so; do
-  if otool -L "$so" 2>/dev/null | grep -E '/usr/local/|/opt/homebrew/' >/dev/null; then
-    echo "!! Homebrew link in $so:" >&2
-    otool -L "$so" | grep -E '/usr/local/|/opt/homebrew/' >&2
+  if otool -L "$so" 2>/dev/null | awk '/^[[:space:]]+\// && $1 !~ "^/usr/lib/" && $1 !~ "^/System/Library/" {found=1} END {exit !found}'; then
+    echo "!! External non-system link in $so:" >&2
+    otool -L "$so" >&2
     LEAK=1
   fi
 done < <(find "$APP_BUNDLE" -type f \( -name '*.so' -o -name '*.dylib' \))

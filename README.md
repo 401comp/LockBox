@@ -66,7 +66,8 @@ vaults remain readable for compatibility, but all new vaults are single files.
 
 ## Build
 
-Requires Homebrew Python 3.14 with Tk 9.
+Requires a current framework Python from python.org with Tk support. This is
+only needed to build from source; people installing the release do not need it.
 
 ```
 ./build.sh
@@ -74,8 +75,8 @@ Requires Homebrew Python 3.14 with Tk 9.
 
 That script creates a local `.venv`, installs `cryptography` and `py2app`,
 runs the self-test, builds `dist/LockBox.app`, checks with `otool -L` that
-nothing links back to Homebrew paths (so the .app runs on Macs without
-Homebrew), and produces `dist/LockBox.dmg` and the self-contained
+nothing links to an external non-system library, and produces
+`dist/LockBox.dmg` and the self-contained
 `dist/LockBox-macos.zip`.
 
 Override the interpreter with `PYTHON_BIN=/path/to/python ./build.sh`.
