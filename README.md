@@ -114,3 +114,8 @@ this repo rather than being written ad-hoc.
 ## License
 
 MIT — see `LICENSE`.
+## Support
+
+Found a problem? [Report it on GitHub](https://github.com/401comp/LockBox/issues/new?template=bug_report.md).
+Please include the app version and your macOS version, but never include passwords,
+keys, or private files.
